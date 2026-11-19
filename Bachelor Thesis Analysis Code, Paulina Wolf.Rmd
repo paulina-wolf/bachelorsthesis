@@ -1,0 +1,455 @@
+---
+title: "Bachelor Thesis Analysis Code"
+author: "Paulina Wolf (1935926)"
+date: "2025-05-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(fixest)
+library(tidyverse)
+library(patchwork)
+library(webshot2)
+library(modelsummary)
+library(kableExtra)
+library(marginaleffects)
+library(margins)
+library(interactions)
+
+
+final_data <- read.csv("ClimateConflict_BAdata_PaulinaWolf.csv")
+```
+
+##Prep##
+```{r}
+# Create a unique grid-cell ID from lon/lat
+final_data <- final_data %>%
+  mutate(cell_id = paste0("cell_", lon, "_", lat))
+
+# Code missing lagged deaths & season intensity as 0
+final_data <- final_data %>%
+  mutate(
+    ag_season_intensity = replace_na(ag_season_intensity, 0),
+    lagged_deaths = replace_na(lagged_deaths, 0))
+# Do it as there is large 0 mass for ag_season_intensity, that is not because of missings, but because there are agriculturally non-vialble areas like desert and jungle where season intensity is 0
+# Lagged deaths are missing when there was no conflict in the previous month, so the 0 can be substituted
+```
+
+
+##Models without time lag##
+```{r, temperature model}
+# Model 1 on cell-month level
+model_temp1 <- feols(
+  conflict_any ~ temp_anomaly * ag_season_intensity + temp_anomaly * has_excluded_group + lagged_deaths + nightlight_z | cell_id + year + month, data = final_data, cluster = ~cell_id
+  )
+# Model 2 on country-level
+model_temp2 <- feols(
+  conflict_any ~ temp_anomaly * nd_gain_score + lagged_deaths + nightlight_z | country + year, data = final_data, cluster = ~cell_id
+  )
+```
+
+```{r, precipitation model}
+# Model 1 on cm-level
+model_precip1 <- feols(
+  conflict_any ~ precip_anomaly * ag_season_intensity + precip_anomaly * has_excluded_group +lagged_deaths + nightlight_z | cell_id + year + month, data = final_data, cluster = ~cell_id
+  )
+# Model 2 on cy-level
+model_precip2 <- feols(
+  conflict_any ~ precip_anomaly * nd_gain_score +lagged_deaths + nightlight_z | country + year, data = final_data, cluster = ~cell_id
+  )
+```
+
+```{r, climate disaster model}
+# Model 1 on cm-level
+model_disaster1 <- feols(
+  conflict_any ~ disaster_occurred * ag_season_intensity + disaster_occurred * has_excluded_group +lagged_deaths + nightlight_z | cell_id + year + month, data = final_data, cluster = ~cell_id
+  )
+# Model 2 on cy-level
+model_disaster2 <- feols(
+  conflict_any ~ disaster_occurred * nd_gain_score +lagged_deaths + nightlight_z | country + year, data = final_data, cluster = ~cell_id
+  )
+```
+
+##Models with timelags##
+```{r, prep for time lags}
+# Create 3, 6 and 12 month time lags 
+final_data1 <- final_data %>%
+  group_by(cell_id) %>%
+  arrange(year, month) %>%
+  mutate(
+    temp_anomaly_lag3 = lag(temp_anomaly, 3),
+    precip_anomaly_lag3 = lag(precip_anomaly, 3),
+    disaster_occurred_lag3 = lag(disaster_occurred, 3)
+  ) %>%
+  ungroup()
+
+final_data1 <- final_data1 %>%
+  group_by(cell_id) %>%
+  arrange(year, month) %>%
+  mutate(
+    temp_anomaly_lag6 = lag(temp_anomaly, 6),
+    precip_anomaly_lag6 = lag(precip_anomaly, 6),
+    disaster_occurred_lag6 = lag(disaster_occurred, 6)
+  ) %>%
+  ungroup()
+
+final_data1 <- final_data1 %>%
+  group_by(cell_id) %>%
+  arrange(year, month) %>%
+  mutate(
+    temp_anomaly_lag12 = lag(temp_anomaly, 12),
+    precip_anomaly_lag12 = lag(precip_anomaly, 12),
+    disaster_occurred_lag12 = lag(disaster_occurred, 12)
+  ) %>% 
+  ungroup()
+```
+
+```{r, temp lags}
+# Model 1
+model_temp1_lag3 <- feols(
+  conflict_any ~ temp_anomaly_lag3 * ag_season_intensity + temp_anomaly_lag3 * has_excluded_group +lagged_deaths + nightlight_z | cell_id + year + month, data = final_data1, cluster = ~cell_id
+  )
+model_temp1_lag6 <- feols(
+  conflict_any ~ temp_anomaly_lag6 * ag_season_intensity + temp_anomaly_lag6 * has_excluded_group +lagged_deaths + nightlight_z | cell_id + year + month, data = final_data1, cluster = ~cell_id
+  )
+model_temp1_lag12 <- feols(
+  conflict_any ~ temp_anomaly_lag12 * ag_season_intensity + temp_anomaly_lag12 * has_excluded_group +lagged_deaths + nightlight_z | cell_id + year +  month, data = final_data1, cluster = ~cell_id
+  )
+
+# Model 2
+model_temp2_lag3 <- feols(
+  conflict_any ~ temp_anomaly_lag3 * nd_gain_score +lagged_deaths + nightlight_z | country + year, data = final_data1, cluster = ~cell_id
+  )
+model_temp2_lag6 <- feols(
+  conflict_any ~ temp_anomaly_lag6 * nd_gain_score +lagged_deaths + nightlight_z | country + year, data = final_data1, cluster = ~cell_id
+  )
+model_temp2_lag12 <- feols(
+  conflict_any ~ temp_anomaly_lag12 * nd_gain_score +lagged_deaths + nightlight_z | country + year, data = final_data1, cluster = ~cell_id
+  )
+
+# Visualization (not included in BA)
+modelsummary(list("Temp (No Lag)" = model_temp1, 
+                  "Temp (Lag 3M)" = model_temp1_lag3,
+                  "Temp (Lag 6M)" = model_temp1_lag6,
+                  "Temp (Lag 12M)" = model_temp1_lag12),
+             output = "BATable1.png",                
+             stars = TRUE,                   
+             fmt = 5,                        
+             statistic = "p.value",
+             gof_omit = "IC|Log|Adj|RMSE|FE|Std.Errors"
+)
+
+modelsummary(list("Temp (No Lag)" = model_temp2, 
+                  "Temp (Lag 3M)" = model_temp2_lag3,
+                  "Temp (Lag 6M)" = model_temp2_lag6,
+                  "Temp (Lag 12M)" = model_temp2_lag12),
+             output = "BATable1.2.png",                
+             stars = TRUE,                   
+             fmt = 5,                        
+             statistic = "p.value",
+             gof_omit = "IC|Log|Adj|RMSE|FE|Std.Errors"
+)
+```
+
+```{r, pre lags}
+# Model 1
+model_precip1_lag3 <- feols(
+  conflict_any ~ precip_anomaly_lag3 * ag_season_intensity + precip_anomaly_lag3 * has_excluded_group +lagged_deaths + nightlight_z | cell_id + year + month, data = final_data1, cluster = ~cell_id
+  )
+model_precip1_lag6 <- feols(
+  conflict_any ~ precip_anomaly_lag6 * ag_season_intensity + precip_anomaly_lag6 * has_excluded_group +lagged_deaths + nightlight_z | cell_id + year + month, data = final_data1, cluster = ~cell_id
+  )
+model_precip1_lag12 <- feols(
+  conflict_any ~ precip_anomaly_lag12 * ag_season_intensity + precip_anomaly_lag12 * has_excluded_group +lagged_deaths + nightlight_z | cell_id + year + month, data = final_data1, cluster = ~cell_id
+  )
+
+# Model 2
+model_precip2_lag3 <- feols(
+  conflict_any ~ precip_anomaly_lag3 * nd_gain_score +lagged_deaths + nightlight_z | country + year, data = final_data1, cluster = ~cell_id
+  )
+model_precip2_lag6 <- feols(
+  conflict_any ~ precip_anomaly_lag6 * nd_gain_score +lagged_deaths + nightlight_z | country + year, data = final_data1, cluster = ~cell_id
+  )
+model_precip2_lag12 <- feols(
+  conflict_any ~ precip_anomaly_lag12 * nd_gain_score +lagged_deaths + nightlight_z | country + year, data = final_data1, cluster = ~cell_id
+  )
+
+# Visualization (not included in BA)
+modelsummary(list("Precip (No Lag)" = model_precip1, 
+                  "Precip (Lag 3M)" = model_precip1_lag3,
+                  "Precip (Lag 6M)" = model_precip1_lag6,
+                  "Precip (Lag 12M)" = model_precip1_lag12),
+             output = "BATable2.png",                
+             stars = TRUE,                   
+             fmt = 5,                        
+             statistic = c("std.error", "p.value"),
+             gof_omit = "IC|Log|Adj|RMSE|FE|Std.Errors"
+)
+
+modelsummary(list("Precip (No Lag)" = model_precip2, 
+                  "Precip (Lag 3M)" = model_precip2_lag3,
+                  "Precip (Lag 6M)" = model_precip2_lag6,
+                  "Precip (Lag 12M)" = model_precip2_lag12),
+             output = "BATable2.2.png",                
+             stars = TRUE,                   
+             fmt = 5,                        
+             statistic = c("std.error", "p.value"),
+             gof_omit = "IC|Log|Adj|RMSE|FE|Std.Errors"
+)
+```
+
+```{r, disaster lags}
+# Model 1
+model_disaster1_lag3 <- feols(
+  conflict_any ~ disaster_occurred_lag3 * ag_season_intensity + disaster_occurred_lag3 * has_excluded_group + lagged_deaths + nightlight_z | cell_id + year + month, data = final_data1, cluster = ~cell_id
+  )
+model_disaster1_lag6 <- feols(
+  conflict_any ~ disaster_occurred_lag6 * ag_season_intensity + disaster_occurred_lag6 * has_excluded_group + lagged_deaths + nightlight_z | cell_id + year + month, data = final_data1, cluster = ~cell_id
+  )
+model_disaster1_lag12 <- feols(
+  conflict_any ~ disaster_occurred_lag12 * ag_season_intensity + disaster_occurred_lag12 * has_excluded_group + lagged_deaths + nightlight_z | cell_id + year + month, data = final_data1, cluster = ~cell_id
+  )
+
+# Model 2
+model_disaster2_lag3 <- feols(
+  conflict_any ~ disaster_occurred_lag3 * nd_gain_score + lagged_deaths + nightlight_z | country  + year, data = final_data1, cluster = ~cell_id
+  )
+model_disaster2_lag6 <- feols(
+  conflict_any ~ disaster_occurred_lag6 * nd_gain_score + lagged_deaths + nightlight_z | country + year, data = final_data1, cluster = ~cell_id
+  )
+model_disaster2_lag12 <- feols(
+  conflict_any ~ disaster_occurred_lag12 * nd_gain_score + lagged_deaths + nightlight_z | country + year, data = final_data1, cluster = ~cell_id
+  )
+
+# Visualization (not included in BA)
+modelsummary(list("Disaster (No Lag)" = model_disaster1, 
+                  "Disaster (Lag 3M)" = model_disaster1_lag3,
+                  "Disaster (Lag 6M)" = model_disaster1_lag6,
+                  "Disaster (Lag 12M)" = model_disaster1_lag12),
+             output = "BATable3.png",                
+             stars = TRUE,                   
+             fmt = 5,                        
+             statistic = "p.value",
+             gof_omit = "IC|Log|Adj|RMSE|FE|Std.Errors"
+)
+
+modelsummary(list("Disaster (No Lag)" = model_disaster2, 
+                  "Disaster (Lag 3M)" = model_disaster2_lag3,
+                  "Disaster (Lag 6M)" = model_disaster2_lag6,
+                  "Disaster (Lag 12M)" = model_disaster2_lag12),
+             output = "BATable3.2.png",                
+             stars = TRUE,                   
+             fmt = 5,                        
+             statistic = "p.value",
+             gof_omit = "IC|Log|Adj|RMSE|FE|Std.Errors"
+)
+```
+
+```{r, precipitation interaction visualization}
+# Model without interaction
+modelprecip_no_interaction <- feols(conflict_any ~ precip_anomaly + ag_season_intensity + lagged_deaths + nightlight_z | cell_id + year + month,
+                              data = final_data, cluster = ~cell_id)
+
+# Model with interaction
+modelprecip_with_interaction <- feols(conflict_any ~ precip_anomaly * ag_season_intensity + lagged_deaths + nightlight_z | cell_id + year + month,
+                                data = final_data, cluster = ~cell_id)
+
+# Predictions from model without interaction
+pred_no_int <- plot_predictions(modelprecip_no_interaction, 
+                                condition = "precip_anomaly", 
+                                draw = FALSE)  
+
+# With interaction: set ag_season_intensity to fixed levels (min & max)
+pred_with_int_max <- plot_predictions(modelprecip_with_interaction,
+                                  condition = list(
+                                    precip_anomaly = seq(min(final_data$precip_anomaly, na.rm = TRUE),         max(final_data$precip_anomaly, na.rm = TRUE),
+                                                         length.out = 100),
+                                    ag_season_intensity =  12
+                                  ),
+                                  draw = FALSE)
+
+pred_with_int_min <- plot_predictions(modelprecip_with_interaction,
+                                  condition = list(
+                                    precip_anomaly = seq(min(final_data$precip_anomaly, na.rm = TRUE),         max(final_data$precip_anomaly, na.rm = TRUE),
+                                                         length.out = 100),
+                                    ag_season_intensity =  -1
+                                  ),
+                                  draw = FALSE)
+
+
+# Add a model label to distinguish
+pred_no_int$model <- "Without agricultural season intensity"
+pred_with_int_max$model <- "With high agricultural season intensity"
+pred_with_int_min$model <- "With low agricultural season intensity"
+
+# Combine datasets
+all_preds <- rbind(pred_no_int, pred_with_int_max, pred_with_int_min)
+
+# Plot
+precipplot <- ggplot(all_preds, aes(x = precip_anomaly, y = estimate, color = model)) +
+  geom_line(size = 1) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high, fill = model), alpha = 0.2, color = NA) +
+ labs(
+    x = "Abnormal Precipitation",
+    y = "Predicted Probability of Conflict",
+    color = "Model Type",
+    fill = "Model Type"
+  ) +
+  theme_minimal()
+
+# Save
+ggsave("precipxagintenstiy.png",plot = precipplot, width = 7, height = 5, dpi = 300)
+```
+
+```{r, table for thesis model 1}
+# Creating labels
+coef_rename <- c(
+  "temp_anomaly" = "Temperature Anomaly",
+  "precip_anomaly" = "Precipitation Anomaly",
+  "disaster_occurred" = "Disaster Occurred",
+
+  "temp_anomaly_lag3" = "Temperature Anomaly",
+  "temp_anomaly_lag6" = "Temperature Anomaly",
+  "temp_anomaly_lag12" = "Temperature Anomaly",
+
+  "precip_anomaly_lag3" = "Precipitation Anomaly",
+  "precip_anomaly_lag6" = "Precipitation Anomaly",
+  "precip_anomaly_lag12" = "Precipitation Anomaly",
+
+  "disaster_occurred_lag3" = "Disaster Occurred",
+  "disaster_occurred_lag6" = "Disaster Occurred",
+  "disaster_occurred_lag12" = "Disaster Occurred",
+  
+  "ag_season_intensity" = "Agricultural Intensity",
+  "has_excluded_groupTRUE" = "Ethnic Exclusion",
+  "lagged_deaths" = "Lagged Conflict",
+  "nightlight_z" = "Nightlights (Economic Activity)",
+
+  "temp_anomaly:ag_season_intensity" = "Ag. Intensity × Temperature",
+  "temp_anomaly_lag3:ag_season_intensity" = "Ag. Intensity × Temperature",
+  "temp_anomaly_lag6:ag_season_intensity" = "Ag. Intensity × Temperature",
+  "temp_anomaly_lag12:ag_season_intensity" = "Ag. Intensity × Temperature",
+
+  "precip_anomaly:ag_season_intensity" = "Ag. Intensity × Precipitation",
+  "precip_anomaly_lag3:ag_season_intensity" = "Ag. Intensity × Precipitation",
+  "precip_anomaly_lag6:ag_season_intensity" = "Ag. Intensity × Precipitation",
+  "precip_anomaly_lag12:ag_season_intensity" = "Ag. Intensity × Precipitation",
+
+  "disaster_occurred:ag_season_intensity" = "Ag. Intensity × Disaster",
+   "disaster_occurred_lag3:ag_season_intensity" = "Ag. Intensity × Disaster",
+  "disaster_occurred_lag6:ag_season_intensity" = "Ag. Intensity × Disaster",
+  "disaster_occurred_lag12:ag_season_intensity" = "Ag. Intensity × Disaster",
+
+
+  "temp_anomaly:has_excluded_groupTRUE" = "Ethnic Exclusion × Temperature",
+  "temp_anomaly_lag3:has_excluded_groupTRUE" = "Ethnic Exclusion × Temperature",
+  "temp_anomaly_lag6:has_excluded_groupTRUE" = "Ethnic Exclusion × Temperature",
+  "temp_anomaly_lag12:has_excluded_groupTRUE" = "Ethnic Exclusion × Temperature",
+
+  "precip_anomaly:has_excluded_groupTRUE" = "Ethnic Exclusion × Precipitation",
+   "precip_anomaly_lag3:has_excluded_groupTRUE" = "Ethnic Exclusion × Precipitation",
+  "precip_anomaly_lag6:has_excluded_groupTRUE" = "Ethnic Exclusion × Precipitation",
+  "precip_anomaly_lag12:has_excluded_groupTRUE" = "Ethnic Exclusion × Precipitation",
+
+  "disaster_occurred:has_excluded_groupTRUE" = "Ethnic Exclusion × Disaster",
+  "disaster_occurred_lag3:has_excluded_groupTRUE" = "Ethnic Exclusion × Disaster",
+  "disaster_occurred_lag6:has_excluded_groupTRUE" = "Ethnic Exclusion × Disaster",
+  "disaster_occurred_lag12:has_excluded_groupTRUE" = "Ethnic Exclusion × Disaster"
+)
+
+# List models
+models1_table <- list(
+  "Temp (No Lag)" = model_temp1,
+  "Temp (3M Lag)" = model_temp1_lag3,
+  "Temp (6M Lag)" = model_temp1_lag6,
+  "Temp (12M Lag)" = model_temp1_lag12,
+  "Precip (No Lag)" = model_precip1,
+  "Precip (3M Lag)" = model_precip1_lag3,
+  "Precip (6M Lag)" = model_precip1_lag6,
+  "Precip (12M Lag)" = model_precip1_lag12,
+  "Disaster (No Lag)" = model_disaster1,
+  "Disaster (3M Lag)" = model_disaster1_lag3,
+  "Disaster (6M Lag)" = model_disaster1_lag6,
+  "Disaster (12M Lag)" = model_disaster1_lag12
+)
+
+# Generate table
+modelsummary(
+  models1_table,
+  coef_map = coef_rename,
+  stars = TRUE,
+  fmt = 5,
+  gof_omit = "Adj|IC|Log|RMSE|FE|Std.Errors",
+  output = "BAtable0.png"
+  )
+
+```
+
+```{r, table for thesis model 2}
+# Creating labels
+coef_rename2 <- c(
+  "temp_anomaly" = "Temperature Anomaly",
+  "precip_anomaly" = "Precipitation Anomaly",
+  "disaster_occurred" = "Disaster Occurred",
+
+  "temp_anomaly_lag3" = "Temperature Anomaly",
+  "temp_anomaly_lag6" = "Temperature Anomaly",
+  "temp_anomaly_lag12" = "Temperature Anomaly",
+
+  "precip_anomaly_lag3" = "Precipitation Anomaly",
+  "precip_anomaly_lag6" = "Precipitation Anomaly",
+  "precip_anomaly_lag12" = "Precipitation Anomaly",
+
+  "disaster_occurred_lag3" = "Disaster Occurred",
+  "disaster_occurred_lag6" = "Disaster Occurred",
+  "disaster_occurred_lag12" = "Disaster Occurred",
+  
+  "nd_gain_score" = "Vulnerability",
+  "lagged_deaths" = "Lagged Conflict",
+  "nightlight_z" = "Nightlights (Economic Activity)",
+
+  "temp_anomaly:nd_gain_score" = "Vulnerability × Temperature",
+  "temp_anomaly_lag3:nd_gain_score" = "Vulnerability × Temperature",
+  "temp_anomaly_lag6:nd_gain_score" = "Vulnerability × Temperature",
+  "temp_anomaly_lag12:nd_gain_score" = "Vulnerability × Temperature",
+
+  "precip_anomaly:nd_gain_score" = "Vulnerability × Precipitation",
+  "precip_anomaly_lag3:nd_gain_score" = "Vulnerability × Precipitation",
+  "precip_anomaly_lag6:nd_gain_score" = "Vulnerability × Precipitation",
+  "precip_anomaly_lag12:nd_gain_score" = "Vulnerability × Precipitation",
+
+  "disaster_occurred:nd_gain_score" = "Vulnerability × Disaster",
+   "disaster_occurred_lag3:nd_gain_score" = "Vulnerability × Disaster",
+  "disaster_occurred_lag6:nd_gain_score" = "Vulnerability × Disaster",
+  "disaster_occurred_lag12:nd_gain_score" = "Vulnerability × Disaster"
+)
+
+# List models
+models2_table <- list(
+  "Temp (No Lag)" = model_temp2,
+  "Temp (3M Lag)" = model_temp2_lag3,
+  "Temp (6M Lag)" = model_temp2_lag6,
+  "Temp (12M Lag)" = model_temp2_lag12,
+  "Precip (No Lag)" = model_precip2,
+  "Precip (3M Lag)" = model_precip2_lag3,
+  "Precip (6M Lag)" = model_precip2_lag6,
+  "Precip (12M Lag)" = model_precip2_lag12,
+  "Disaster (No Lag)" = model_disaster2,
+  "Disaster (3M Lag)" = model_disaster2_lag3,
+  "Disaster (6M Lag)" = model_disaster2_lag6
+)
+
+# Generate table
+modelsummary(
+  models2_table,
+  coef_map = coef_rename2,
+  stars = TRUE,
+  fmt = 4,
+  gof_omit = "Adj|IC|Log|RMSE|FE|Std.Errors",
+  output = "BAtable10.png"
+)
+```

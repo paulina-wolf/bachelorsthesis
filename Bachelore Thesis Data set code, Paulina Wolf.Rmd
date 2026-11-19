@@ -1,0 +1,833 @@
+---
+title: "NEW dependent+ independent variables data"
+author: "Paulina Wolf (1935926)"
+date: "2025-05-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+######dependent & independent variables######
+```{r, get the CRU data and prepare it }
+library(raster)
+library(tidyverse)
+library(ncdf4)
+library(terra)
+library(sf)
+library(rnaturalearth)
+library(devtools)
+library(geosphere)  
+library(countrycode)
+library(R.utils)
+library(patchwork) 
+library(readxl)
+library(janitor)
+
+# List all .gz files for temp and precipitation
+#gz_files <- list.files("C:/Users/Pauli/Documents/Uni 6. Semester/Bachelor Arbeit/Data Teil/CRU data", pattern = "\\.gz$", full.names = TRUE)
+
+# Unzip all of them if not already extracted
+#for (gz in gz_files) {
+  #nc_name <- sub("\\.gz$", "", gz)  
+  #if (!file.exists(nc_name)) {
+    #message("Unzipping: ", gz)
+    #R.utils::gunzip(gz, overwrite = FALSE)
+  #}
+#}
+#The code above is written as comments, as it only needs to run once and would stop the run after this first time. It is needed for replicability though, as the raw data needs to be unpacked first
+
+# Load temperature (CRU)
+t1 <- brick("cru_ts4.07.1991.2000.tmp.dat.nc", varname = "tmp")
+t2 <- brick("cru_ts4.07.2001.2010.tmp.dat.nc", varname = "tmp")
+
+# Load temperature (1961–1990 = baseline)
+t0_1 <- brick("cru_ts4.07.1961.1970.tmp.dat.nc", varname = "tmp")
+t0_2 <- brick("cru_ts4.07.1971.1980.tmp.dat.nc", varname = "tmp")
+t0_3 <- brick("cru_ts4.07.1981.1990.tmp.dat.nc", varname = "tmp")
+t0 <- stack(t0_1, t0_2, t0_3)
+
+# Load precipitation (CRU)
+p1 <- brick("cru_ts4.07.1991.2000.pre.dat.nc", varname = "pre")
+p2 <- brick("cru_ts4.07.2001.2010.pre.dat.nc", varname = "pre")
+
+# Load precipitation (1961–1990 = baseline)
+p0_1 <- brick("cru_ts4.07.1961.1970.pre.dat.nc", varname = "pre")
+p0_2 <- brick("cru_ts4.07.1971.1980.pre.dat.nc", varname = "pre")
+p0_3 <- brick("cru_ts4.07.1981.1990.pre.dat.nc", varname = "pre")
+p0 <- stack(p0_1, p0_2, p0_3)
+
+# Subset 1996–2010
+t_hist <- subset(t1, 61:120)
+t_future <- subset(t2, 1:120)
+temp_stack <- stack(t_hist, t_future)
+
+p_hist <- subset(p1, 61:120)
+p_future <- subset(p2, 1:120)
+pre_stack <- stack(p_hist, p_future)
+
+# Crop to Africa
+africa_extent <- extent(-20, 55, -40, 40)
+temp_stack <- crop(temp_stack, africa_extent)
+pre_stack <- crop(pre_stack, africa_extent)
+t0 <- crop(t0, africa_extent)
+p0 <- crop(p0, africa_extent)
+
+# Aggregate to 1° resolution
+temp_1deg <- aggregate(temp_stack, fact = 2, fun = mean)
+pre_1deg <- aggregate(pre_stack, fact = 2, fun = mean)
+temp_base_1deg <- aggregate(t0, fact = 2, fun = mean)
+pre_base_1deg <- aggregate(p0, fact = 2, fun = mean)
+
+# Convert to tidy data frames
+extract_climate <- function(r, var) {
+  df <- as.data.frame(rasterToPoints(r))
+  df_long <- df %>%
+    rename(lon = x, lat = y) %>%
+    pivot_longer(cols = starts_with("X"), names_to = "date", values_to = var) %>%
+    mutate(
+      date = gsub("X", "", date),
+      year = as.integer(substr(date, 1, 4)),
+      month = as.integer(substr(date, 6, 7))
+    ) %>%
+    dplyr::select(lon, lat, year, month, !!sym(var))
+  return(df_long)
+}
+
+temp_df <- extract_climate(temp_1deg, "temperature")
+pre_df  <- extract_climate(pre_1deg, "precipitation")
+baseline_temp_df <- extract_climate(temp_base_1deg, "temperature")
+baseline_pre_df  <- extract_climate(pre_base_1deg, "precipitation")
+
+# Get monthly baseline averages (1961–1990)
+monthly_baseline_temp <- baseline_temp_df %>%
+  group_by(lon, lat, month) %>%
+  summarise(temp_1961_1990 = mean(temperature, na.rm = TRUE), .groups = "drop")
+
+monthly_baseline_precip <- baseline_pre_df %>%
+  group_by(lon, lat, month) %>%
+  summarise(precip_1961_1990 = mean(precipitation, na.rm = TRUE), .groups = "drop")
+
+# Merge climate + baselines + anomalies
+climate_grid <- left_join(temp_df, pre_df, by = c("lon", "lat", "year", "month")) %>%
+  left_join(monthly_baseline_temp, by = c("lon", "lat", "month")) %>%
+  left_join(monthly_baseline_precip, by = c("lon", "lat", "month")) %>%
+  mutate(
+    temp_anomaly = temperature - temp_1961_1990 - 0.3,  # shift to preindustrial
+    precip_anomaly = precipitation - precip_1961_1990
+  )
+
+# Assign country
+coords <- climate_grid %>% 
+  dplyr::select(lon, lat)
+africa_sf <- rnaturalearth::ne_countries(continent = "Africa", scale = "medium", returnclass = "sf")
+grid_sf <- st_as_sf(climate_grid, coords = c("lon", "lat"), crs = 4326)
+grid_sf_buffered <- st_buffer(grid_sf, dist = 0.01)
+grid_with_country <- st_join(grid_sf_buffered, africa_sf["name"])
+
+# Final tidy dataset
+climate_grid_country <- grid_with_country %>%
+  st_drop_geometry() %>%
+  bind_cols(coords) %>%
+  rename(country = name) %>%
+  filter(!is.na(country)) %>%
+  dplyr::select(year, month, lon, lat, country,
+         temperature, temp_anomaly,
+         precipitation, precip_anomaly)
+
+# Check on the results on map
+africa_map <- ne_countries(continent = "Africa", scale = "medium", returnclass = "sf")
+
+# Create a flag for whether a country was assigned
+climate_grid_country <- climate_grid_country %>%
+  mutate(country_assigned = !is.na(country))
+
+# Convert to sf for plotting
+climate_points_sf <- st_as_sf(climate_grid_country, coords = c("lon", "lat"), crs = 4326)
+
+# Plot: Assigned vs. unassigned
+ggplot() +
+  geom_sf(data = africa_map, fill = "gray95", color = "black") +
+  geom_sf(data = climate_points_sf, aes(color = country_assigned), size = 0.5, alpha = 0.6) +
+  scale_color_manual(values = c("FALSE"="red", "TRUE"= "blue"), labels = c("FALSE" = "Unassigned","TRUE"="Assigned")) +
+  labs(title = "Grid Cells Assigned to Countries",
+       subtitle = "Blue = assigned, Red = missing country",
+       color = "Country assigned?") +
+  theme_minimal()
+
+```
+
+```{r, loading EMDAT}
+# Load EM-DAT 
+emdat <- read_excel("public_emdat_custom_request_2025-04-28_d69ff580-5c40-4e1d-980f-c5ad95b493a1.xlsx", sheet = "EM-DAT Data")
+
+# Clean column names 
+emdat <- janitor::clean_names(emdat)
+
+# Select relevant disasters
+emdat <- emdat %>% 
+  dplyr::filter(disaster_type %in% c("Storm", "Flood", "Drought", "Extreme Temperature", "Glacial lake outburst flood", "Mass movement (wet)", "Wildfire"))
+
+# Keep relevant columns
+emdat_slim <- emdat %>%
+  dplyr::select(country, start_year, start_month, disaster_type, total_deaths) %>%
+  rename(year = start_year, month = start_month)
+
+# Collapse to deadliest disaster
+emdat_slim <- emdat_slim %>%
+  group_by(country, year, month) %>%
+  slice_max(order_by = total_deaths, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# Join with other data
+climate_grid_final <- climate_grid_country %>%
+  left_join(emdat_slim, by = c("country", "year", "month")) %>%
+  mutate(disaster_occurred = ifelse(is.na(disaster_type), 0, 1)) %>% 
+  dplyr::select(-total_deaths)
+
+# Create disaster dummy
+climate_grid_final$disaster_occurred <- ifelse(is.na(climate_grid_final$disaster_type), 0, 1)
+
+# Drop the country_assigned
+climate_grid_final <- climate_grid_final %>% 
+  dplyr::select(-country_assigned)
+
+glimpse(climate_grid_final)
+```
+
+```{r, join in UCPD}
+# Loading the GED data
+ged <- read.csv("GEDEvent.csv")
+
+# Clean and round GED coordinates to match grid
+ged1 <- ged %>%
+  mutate(
+    year = as.integer(year),
+    month = as.integer(month),
+    lon = round(lon),   # rounding to 1-degree grid
+    lat = round(lat)
+  )
+
+# Clean 
+ged1 <- ged1 %>% 
+  dplyr::select( id, year, type_of_violence, lat, lon, best, month) 
+
+# Aggregate by grid cell + month
+ged_grid <- ged1 %>%
+  group_by(lon, lat, year, month) %>%
+  summarise(
+    deaths = sum(best, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    conflict_any = ifelse(deaths >= 1, 1, 0),
+    conflict_10plus = ifelse(deaths >= 10, 1, 0),
+    conflict_25plus = ifelse(deaths >= 25, 1, 0)
+  )
+table(ged_grid$conflict_10plus)
+
+# Preparing for merge
+ged_grid <- ged_grid %>%
+  mutate(
+    lon = as.integer(round(lon)),
+    lat = as.integer(round(lat))
+  )
+
+# Same for climate grid 
+climate_grid_country <- climate_grid_final %>%
+  mutate(
+    lon = as.integer(round(lon)),
+    lat = as.integer(round(lat))
+  )
+
+# Merge into climate+disaster grid
+final_data <- climate_grid_country %>%
+  left_join(ged_grid, by = c("lon", "lat", "year", "month")) %>%
+  mutate(
+    conflict_any = ifelse(is.na(conflict_any), 0, conflict_any),
+    conflict_10plus = ifelse(is.na(conflict_10plus), 0, conflict_10plus),
+    conflict_25plus = ifelse(is.na(conflict_25plus), 0, conflict_25plus),
+    deaths = ifelse(is.na(deaths), 0, deaths)) 
+
+# Ceck
+table(final_data$conflict_25plus)
+
+# Look at data on Map
+conflict_points <- final_data %>%
+  filter(conflict_10plus == 1) %>%
+  distinct(lon, lat)
+
+conflict_sf <- st_as_sf(conflict_points, coords = c("lon", "lat"), crs = 4326)
+
+ggplot() +
+  geom_sf(data = africa_map, fill = "gray95", color = "black") +
+  geom_sf(data = conflict_sf, color = "darkred", size = 1.2, alpha = 0.7) +
+  labs(title = "Conflict-Affected Grid Cells (≥1 Fatality)",
+       subtitle = "UCDP GED data mapped to 1° x 1° grid",
+       caption = "Source: UCDP GED") +
+  theme_minimal()
+
+# Save 
+write.csv(final_data, "NEWclimateconflict.csv", row.names = FALSE)
+```
+
+####control variables####
+```{r, conflict history}
+# Load data
+final_data <- read.csv("NEWclimateconflict.csv")
+
+# Create date column
+final_data <- final_data %>%
+  mutate(date = as.Date(paste(year, month, "15", sep = "-")))
+
+# Create lagged variable for past month
+final_data <- final_data %>%
+  arrange(lon, lat, date) %>%
+  group_by(lon, lat) %>%
+  mutate(
+    lagged_deaths = dplyr::lag(deaths, n = 1)
+  ) %>%
+  ungroup()
+table(final_data$lagged_deaths)
+```
+
+```{r, distance to capital control}
+# Create data frame of capitals with coordinates
+capitals <- tibble::tibble(
+  country = c("Algeria", "Angola", "Benin", "Botswana", "Burkina Faso", "Burundi", "Cameroon",
+              "Cape Verde", "Central African Republic", "Chad", "Comoros", "Congo", "Cote d'Ivoire",
+              "Democratic Republic of the Congo", "Djibouti", "Egypt", "Equatorial Guinea", "Eritrea",
+              "Eswatini", "Ethiopia", "Gabon", "Gambia", "Ghana", "Guinea", "Guinea-Bissau",
+              "Kenya", "Lesotho", "Liberia", "Libya", "Madagascar", "Malawi", "Mali", "Mauritania",
+              "Mauritius", "Morocco", "Mozambique", "Namibia", "Niger", "Nigeria", "Rwanda",
+              "Sao Tome and Principe", "Senegal", "Seychelles", "Sierra Leone", "Somalia",
+              "South Africa", "South Sudan", "Sudan", "Tanzania", "Togo", "Tunisia", "Uganda",
+              "Zambia", "Zimbabwe"),
+  capital = c("Algiers", "Luanda", "Porto-Novo", "Gaborone", "Ouagadougou", "Gitega", "Yaounde",
+              "Praia", "Bangui", "N'Djamena", "Moroni", "Brazzaville", "Yamoussoukro", "Kinshasa",
+              "Djibouti", "Cairo", "Malabo", "Asmara", "Mbabane", "Addis Ababa", "Libreville", "Banjul",
+              "Accra", "Conakry", "Bissau", "Nairobi", "Maseru", "Monrovia", "Tripoli", "Antananarivo",
+              "Lilongwe", "Bamako", "Nouakchott", "Port Louis", "Rabat", "Maputo", "Windhoek", "Niamey",
+              "Abuja", "Kigali", "Sao Tome", "Dakar", "Victoria", "Freetown", "Mogadishu", "Pretoria",
+              "Juba", "Khartoum", "Dodoma", "Lome", "Tunis", "Kampala", "Lusaka", "Harare"),
+  lat = c(36.75, -8.84, 6.50, -24.65, 12.37, -3.43, 3.87, 14.92, 4.37, 12.11, -11.70, -4.27, 6.82, -4.32,
+          11.59, 30.03, 3.75, 15.33, -26.32, 9.03, 0.39, 13.45, 5.55, 9.57, 11.85, -1.29, -29.31, 6.30,
+          32.88, -18.91, -13.97, 12.65, 18.08, -20.16, 34.02, -25.97, -22.57, 13.52, 9.06, -1.94, 0.33,
+          14.69, -4.62, 8.48, 2.05, -25.74, 4.85, 15.50, -6.17, 6.13, 36.80, 0.31, -15.42, -17.83),
+  lon = c(3.05, 13.29, 2.62, 25.91, -1.53, 29.93, 11.52, -23.52, 18.58, 15.05, 43.25, 15.28, -5.28, 15.31,
+          43.15, 31.24, 8.78, 38.93, 31.13, 38.74, 9.45, -16.58, -0.20, -13.70, -15.60, 36.82, 27.48,
+          -10.80, 13.19, 47.53, 33.78, -8.00, -15.97, 57.48, -6.83, 32.58, 17.08, 2.11, 7.49, 30.06,
+          6.73, -17.44, 55.45, -13.23, 45.33, 28.19, 31.60, 32.55, 39.20, 1.22, 10.17, 32.58, 28.32, 31.05))
+
+final_data <- final_data %>%
+  mutate(country = recode(country,
+    "Central African Rep." = "Central African Republic",
+    "Côte d'Ivoire" = "Cote d'Ivoire",
+    "Dem. Rep. Congo" = "Democratic Republic of the Congo",
+    "Eq. Guinea" = "Equatorial Guinea",
+    "eSwatini" = "Eswatini",
+    "S. Sudan" = "South Sudan"
+  ))
+
+extra_caps <- tibble::tibble(
+  country = c("Somaliland", "W. Sahara"),
+  capital = c("Hargeisa", "Laayoune"),
+  lat = c(9.56, 27.15),
+  lon = c(44.07, -13.20)
+)
+
+capitals <- bind_rows(capitals, extra_caps)
+
+# Check on map
+# 1. Convert capitals to spatial object
+capitals_sf <- capitals %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326)
+
+# 2. Get Africa base map
+africa <- rnaturalearth::ne_countries(continent = "Africa", returnclass = "sf")
+
+# 3. Plot
+ggplot() +
+  geom_sf(data = africa, fill = "gray95", color = "black") +
+  geom_sf(data = capitals_sf, color = "darkred", size = 2) +
+  geom_text(data = capitals_sf,
+            aes(x = st_coordinates(capitals_sf)[,1],
+                y = st_coordinates(capitals_sf)[,2],
+                label = capital),
+            size = 2.5, vjust = -1, check_overlap = TRUE) +
+  labs(title = "African Capital Cities",
+       subtitle = "Verify locations used for distance calculations",
+       caption = "Data source: Manual entry + rnaturalearth") +
+  theme_minimal()
+
+# Rename for join
+capitals_renamed <- capitals %>%
+  rename(lon_cap = lon, lat_cap = lat)
+
+# Calculate distance to conflict points
+final_data <- final_data %>%
+  left_join(capitals_renamed, by = "country") %>%
+  rowwise() %>%
+  mutate(
+    dist_to_capital_km = geosphere::distHaversine(c(lon, lat), c(lon_cap, lat_cap)) / 1000
+  ) %>%
+  ungroup()
+
+# Normalize with Z-score
+final_data <- final_data %>%
+  mutate(
+    dist_to_capital_z = scale(dist_to_capital_km)[,1]
+  )
+setdiff(unique(final_data$country), capitals$country)
+```
+
+```{r, nightlights control}
+# Getting the data
+#untar("C:/Users/Pauli/Documents/Uni 6. Semester/Bachelor Arbeit/Data Teil/F121995.v4.tar", exdir = "nightlights_1995")
+#untar("C:/Users/Pauli/Documents/Uni 6. Semester/Bachelor Arbeit/Data Teil/F152000.v4.tar", exdir = "nightlights_2000")
+#untar("C:/Users/Pauli/Documents/Uni 6. Semester/Bachelor Arbeit/Data Teil/F162005.v4.tar", exdir = "nightlights_2005")
+#untar("C:/Users/Pauli/Documents/Uni 6. Semester/Bachelor Arbeit/Data Teil/F182010.v4.tar", exdir = "nightlights_2010")
+
+# Unzipping the files
+#gunzip("F121995.v4b_web.stable_lights.avg_vis.tif.gz", remove = FALSE)
+#gunzip("F152000.v4b_web.stable_lights.avg_vis.tif.gz", remove = FALSE)
+#gunzip("F162005.v4b_web.stable_lights.avg_vis.tif.gz", remove = FALSE)
+#gunzip("F182010.v4d_web.stable_lights.avg_vis.tif.gz", remove = FALSE)
+# As in the beginning this code is only needed once
+
+# Loading the data
+nl_raster95 <- raster("F121995.v4b_web.stable_lights.avg_vis.tif")
+nl_raster00 <- raster("F152000.v4b_web.stable_lights.avg_vis.tif")
+nl_raster05 <- raster("F162005.v4b_web.stable_lights.avg_vis.tif")
+nl_raster10 <- raster("F182010.v4d_web.stable_lights.avg_vis.tif")
+
+# Prepare distinct grid-year combinations
+grid_coords_year <- final_data %>%
+  select(lon, lat, year) %>%
+  distinct()
+
+# Assign time bands
+grid_coords_year <- grid_coords_year %>%
+  mutate(
+    time_band = case_when(
+      year >= 1995 & year <= 1999 ~ "1995",
+      year >= 2000 & year <= 2004 ~ "2000",
+      year >= 2005 & year <= 2009 ~ "2005",
+      year >= 2010                ~ "2010"
+    )
+  )
+
+# Convert to sf for spatial extraction
+grid_coords_year_sf <- st_as_sf(grid_coords_year, coords = c("lon", "lat"), crs = 4326)
+
+# Extract from each raster
+extract_nl <- function(sf_data, raster) {
+  coords <- st_coordinates(sf_data)
+  lights <- raster::extract(raster, sf_data)
+  
+  tibble(
+    lon = coords[,1],
+    lat = coords[,2],
+    year = sf_data$year,
+    nightlight = lights
+  )
+}
+
+# Split by time band and extract
+nl_extracted <- bind_rows(
+  extract_nl(filter(grid_coords_year_sf, time_band == "1995"), nl_raster95),
+  extract_nl(filter(grid_coords_year_sf, time_band == "2000"), nl_raster00),
+  extract_nl(filter(grid_coords_year_sf, time_band == "2005"), nl_raster05),
+  extract_nl(filter(grid_coords_year_sf, time_band == "2010"), nl_raster10)
+)
+
+# Merge back into final_data
+final_data <- final_data %>%
+  left_join(nl_extracted, by = c("lon", "lat", "year"))
+
+# Normalize
+final_data <- final_data %>%
+  mutate(nightlight_z = scale(nightlight)[,1])
+```
+
+```{r, vulnerability control}
+nd_gain <- read.csv("vulnerability.csv")
+
+# remove the X from column names
+colnames(nd_gain) <- sub("^X", "", colnames(nd_gain))
+
+# Reshape to long-format
+nd_gain_long <- pivot_longer(nd_gain,
+                              cols = matches("^\\d{4}$"),  # Only year columns
+                              names_to = "year",
+                              values_to = "nd_gain_score") %>% 
+  rename(country = Name)
+
+# Adjusting country names
+nd_gain_long$country[nd_gain_long$country == "Congo, the Democratic Republic o"] <- "Democratic Republic of the Congo"
+nd_gain_long$country[nd_gain_long$country == "Libyan Arab Jamahiriya"] <- "Libya"
+nd_gain_long$country[nd_gain_long$country == "Swaziland"] <- "Eswatini"
+nd_gain_long$country[nd_gain_long$country == "Tanzania, United Republic of"] <- "Tanzania"
+nd_gain_long$country[nd_gain_long$country == "Congo"] <- "Congo"
+
+# Filter
+nd_gain_filtered <- nd_gain_long %>%
+  filter(year %in% 1995:2010,
+         country %in% final_data$country)%>% 
+  select(-ISO3)
+
+# Change class of year
+nd_gain_filtered$year <- as.integer(nd_gain_filtered$year)
+
+# Creating disputed countries
+nd_gain_extra <- nd_gain_filtered %>%
+  filter(country %in% c("Morocco", "Sudan", "Somalia")) %>%
+  mutate(country = recode(country,
+                          "Morocco" = "W. Sahara",
+                          "Sudan" = "South Sudan",
+                          "Somalia" = "Somaliland")) 
+
+# Combine with the main data set
+nd_gain_augmented <- bind_rows(nd_gain_filtered, nd_gain_extra)
+
+# Join 
+final_data <- left_join(final_data, nd_gain_augmented,
+                        by = c("country" = "country", "year" = "year"))
+                        
+summary(final_data$nd_gain_score)
+unique(final_data$year)
+
+# Saving my progress
+write.csv( final_data, "NEWclimateconflictcontrols.csv", row.names = FALSE)
+```
+
+```{r, cropland control}
+# Load
+final_data <- read.csv("NEWclimateconflictcontrols.csv")
+# Set path to the folder containing the TIFFs
+tif_folder <- "C:/Users/Pauli/Documents/Uni 6. Semester/Bachelor Arbeit/Data Teil/MODIS_data"
+
+# List only LC_Type1 TIFFs
+lc_files <- list.files(tif_folder, pattern = "LC_Type1.*\\.tif$", full.names = TRUE)
+
+# Sort by year 
+years <- str_extract(lc_files, "(?<=doy)\\d{4}")
+lc_files <- lc_files[order(as.integer(years))]  # sort chronologically
+
+# Load as a raster stack
+lc_stack <- rast(lc_files)
+
+# Name each layer by its year
+names(lc_stack) <- paste0("lc_", years[order(as.integer(years))])
+
+# Quick check
+print(lc_stack)
+plot(lc_stack[[1]])  # first year land cover
+
+# Merging with final data
+# Prepare points and land cover year column
+final_data <- final_data %>%
+  mutate(lc_year = ifelse(year < 2001, 2001, year))
+
+final_data$row_id <- seq_len(nrow(final_data))
+
+# Convert to SpatVector
+points <- vect(final_data, geom = c("lon", "lat"), crs = "EPSG:4326")
+
+points_proj <- project(points, crs(lc_stack))
+
+# Split final_data by lc_year
+split_data <- split(final_data, final_data$lc_year)
+
+# Initialize list to store extraction results
+extract_list <- lapply(split_data, function(df_group) {
+  layer_name <- paste0("lc_", unique(df_group$lc_year))
+  
+  # Safety check
+  if (!(layer_name %in% names(lc_stack))) {
+    stop(paste("Layer", layer_name, "not found in lc_stack"))
+  }
+  
+  # Extract points by row_id
+  these_points <- points_proj[df_group$row_id, ]
+  
+  # Extract raster values
+  vals <- terra::extract(lc_stack[[layer_name]], these_points)
+  
+  # Return row_id and extracted value
+  tibble(row_id = df_group$row_id, lc_type1 = vals[, 2])
+})
+
+# Combine all extractions
+lc_extracts <- bind_rows(extract_list)
+
+# Merge back into final_data
+final_data <- final_data %>%
+  left_join(lc_extracts, by = "row_id") %>%
+  select(-row_id, -lc_year)
+
+# Create a dummy for cropland presence
+final_data <- final_data %>%
+  mutate(cropland_dummy = ifelse(lc_type1 %in% c(12, 14), 1, 0))
+
+ggplot(final_data, aes(x = lon, y = lat, fill = factor(cropland_dummy))) +
+  geom_tile() +
+  scale_fill_manual(values = c("0" = "grey85", "1" = "darkgreen"),
+                    name = "Cropland",
+                    labels = c("No", "Yes")) +
+  coord_fixed() +
+  theme_minimal() +
+  labs(title = "Presence of Cropland by Grid Cell",
+       subtitle = "Based on MODIS Land Cover (LC_Type1)")
+```
+
+```{r, other agriculture controls}
+# Define MODIS Q2 folder and variables
+q2_folder <- "C:/Users/Pauli/Documents/Uni 6. Semester/Bachelor Arbeit/Data Teil/Modis Q2"
+modis_vars <- c("Dormancy_1", "Greenup_1", "EVI_Amplitude_1", "NumCycles")
+
+# Add row_id to keep join integrity
+final_data$row_id <- seq_len(nrow(final_data))
+points <- vect(final_data, geom = c("lon", "lat"), crs = "EPSG:4326")
+
+# Loop over all variables
+for (var in modis_vars) {
+  
+  message("Processing: ", var)
+  
+  # Get files for the variable
+  var_files <- list.files(q2_folder, pattern = paste0(var, ".*\\.tif$"), full.names = TRUE)
+  
+  if (length(var_files) == 0) next  
+  
+  # Extract years
+  years <- str_extract(var_files, "(?<=doy)\\d{4}")
+  var_stack <- rast(var_files)
+  names(var_stack) <- make.unique(paste0(var, "_", years))
+  
+  # Aggregate to 1°x1°
+  var_agg <- aggregate(var_stack, fact = 240, fun = mean, na.rm = TRUE)
+  
+  # Match year in panel (fall back to 2001 for earlier years)
+  modis_years <- as.integer(str_extract(names(var_agg), "\\d{4}"))
+  min_year <- min(modis_years)
+  
+  final_data <- final_data %>%
+    mutate(temp_year = ifelse(year < min_year, min_year, year))
+  
+  # Split panel by year
+  split_data <- split(final_data, final_data$temp_year)
+  
+  # Extract from year-matched layer
+  extract_list <- lapply(split_data, function(df_group) {
+    layer_name <- paste0(var, "_", unique(df_group$temp_year))
+    layer_idx <- grep(paste0("^", layer_name), names(var_agg))
+    
+    if (length(layer_idx) == 0) return(tibble(row_id = df_group$row_id, value = NA))
+    
+    layer_to_extract <- if (length(layer_idx) > 1) {
+      mean(var_agg[[layer_idx]], na.rm = TRUE)
+    } else {
+      var_agg[[layer_idx]]
+    }
+    
+    these_points <- points[df_group$row_id, ]
+    vals <- terra::extract(layer_to_extract, these_points)
+    
+    tibble(row_id = df_group$row_id, value = vals[, 2])
+  })
+  
+  # Combine & merge
+  var_extract <- bind_rows(extract_list)
+  names(var_extract)[2] <- var
+  
+  final_data <- left_join(final_data, var_extract, by = "row_id")
+}
+
+# Clean up
+final_data <- final_data %>% select(-row_id, -temp_year)
+
+
+plot(var_stack[[1]])  # for any variable
+points(final_data$lon, final_data$lat, pch = ".", col = "red")
+
+ggplot(final_data, aes(x = lon, y = lat)) +
+  geom_tile(aes(fill = NumCycles)) +
+  scale_fill_viridis_c(na.value = "red") +
+  coord_fixed() +
+  theme_minimal()
+
+# Calculate growing season length with wraparound handling
+final_data <- final_data %>%
+  mutate(
+    growing_season_length = case_when(
+      is.na(Greenup_1) | is.na(Dormancy_1) ~ NA_real_,
+      Dormancy_1 >= Greenup_1 ~ Dormancy_1 - Greenup_1,
+      TRUE ~ (365 - Greenup_1) + Dormancy_1
+    ),
+    double_season = ifelse(NumCycles >= 2, 1, 0)
+  )
+
+# Normalize variables (full panel)
+final_data <- final_data %>%
+  mutate(
+    gsl_z = scale(growing_season_length)[, 1],
+    evi_z = scale(EVI_Amplitude_1)[, 1],
+    double_z = scale(double_season)[, 1]
+  )
+
+# Calculate ASII (equal weights)
+final_data <- final_data %>%
+  mutate(
+    ag_season_intensity = rowMeans(select(., gsl_z, evi_z, double_z), na.rm = TRUE)
+  )
+
+# Dummy for missings (Sahara/ Jungle)
+final_data <- final_data %>%
+  mutate(missing_agri = as.integer(is.na(ag_season_intensity)))
+```
+
+
+```{r, population density control}
+# Set path to the folder containing the TIFFs
+tif_folder_popdensity <- "C:/Users/Pauli/Documents/Uni 6. Semester/Bachelor Arbeit/Data Teil/World pop GWP4"
+
+# Load the population density rasters
+pop_2000 <- rast("C:/Users/Pauli/Documents/Uni 6. Semester/Bachelor Arbeit/Data Teil/World pop GWP4/GPW_UN_Adj_PopDensity.411_population-density_doy2000183_aid0001.tif")
+pop_2005 <- rast("C:/Users/Pauli/Documents/Uni 6. Semester/Bachelor Arbeit/Data Teil/World pop GWP4/GPW_UN_Adj_PopDensity.411_population-density_doy2005182_aid0001.tif")
+pop_2010 <- rast("C:/Users/Pauli/Documents/Uni 6. Semester/Bachelor Arbeit/Data Teil/World pop GWP4/GPW_UN_Adj_PopDensity.411_population-density_doy2010182_aid0001.tif")
+
+# Name and stack rasters
+names(pop_2000) <- "pop_2000"
+names(pop_2005) <- "pop_2005"
+names(pop_2010) <- "pop_2010"
+pop_stack <- c(pop_2000, pop_2005, pop_2010)
+
+# Assign population raster year to final_data
+final_data <- final_data %>%
+  mutate(pop_year = case_when(
+    year <= 2003 ~ 2000,
+    year <= 2007 ~ 2005,
+    TRUE ~ 2010
+  ),
+  row_id = row_number())
+
+# Create projected points
+points <- vect(final_data, geom = c("lon", "lat"), crs = "EPSG:4326")
+
+# Split data by pop_year
+split_data <- split(final_data, final_data$pop_year)
+
+# Extract per group
+extract_list <- lapply(split_data, function(df_group) {
+  layer_name <- paste0("pop_", unique(df_group$pop_year))
+  these_points <- points[df_group$row_id, ]
+  vals <- terra::extract(pop_stack[[layer_name]], these_points)
+  tibble(row_id = df_group$row_id, pop_density = vals[, 2])
+})
+
+# Merge back into final_data
+pop_extracts <- bind_rows(extract_list)
+final_data <- final_data %>%
+  left_join(pop_extracts, by = "row_id") %>%
+  select(-row_id, -pop_year)
+
+# Filter data for the selected years
+pop_plot_data <- final_data %>%
+  filter(year %in% c(2001, 2005, 2010)) %>%
+  mutate(year = as.factor(year))
+
+# Plot
+ggplot(pop_plot_data, aes(x = lon, y = lat, fill = pop_density)) +
+  geom_tile(width = 1, height = 1) +  
+  facet_wrap(~ year) +
+  scale_fill_viridis_c(
+    trans = "sqrt",         
+    na.value = "grey90",    
+    name = "Pop. Density"
+  ) +
+  coord_fixed() +
+  theme_minimal() +
+  labs(
+    title = "Population Density Across Africa (2001, 2005, 2010)",
+    x = "Longitude", y = "Latitude"
+  )
+
+
+ggplot(final_data, aes(lon, lat)) +
+  geom_tile(aes(fill = is.na(pop_density))) +
+  coord_sf() +
+  scale_fill_manual(values = c("white", "red"), name = "Missing Pop", labels = c("No", "Yes")) +
+  labs(title = "Where is Population Density Missing?") +
+  theme_minimal()
+```
+
+```{r, ethnic fractionalization control}
+geo_epr <- st_read("C:/Users/Pauli/Documents/Uni 6. Semester/Bachelor Arbeit/Data Teil/GeoEPR-2021.shp")
+epr_attr <- read.csv("EPR-2021.csv")
+
+# Join GeoEPR with EPR attributes by groupid and year overlap
+geo_epr_full <- geo_epr %>%
+  left_join(epr_attr %>% select(groupid, from, to, status), by = c("groupid", "from", "to")) %>%
+  filter(from <= 2010 & to >= 1996)
+
+# Fix CRS
+geo_epr_full <- st_transform(geo_epr_full, crs = 4326)
+
+# Drop invalid geometries
+geo_epr_full <- geo_epr_full[st_is_valid(geo_epr_full), ]
+
+# Making sure final_data_sf exists
+final_data_sf <- st_as_sf(final_data, coords = c("lon", "lat"), crs = 4326)
+
+# Join
+grid_with_groups <- st_join(final_data_sf, geo_epr_full, join = st_intersects, left = TRUE)
+
+# Filter
+grid_with_groups <- grid_with_groups %>%
+  filter(year >= from & year <= to)
+
+
+grid_with_groups <- grid_with_groups %>%
+  mutate(lon = st_coordinates(geometry)[,1],
+         lat = st_coordinates(geometry)[,2])
+
+ethnic_summary <- grid_with_groups %>%
+  mutate(
+    status_clean = toupper(trimws(status))  # standardize
+  ) %>%
+  group_by(lon, lat, year) %>%
+  summarise(
+    has_excluded_group = any(status_clean %in% c("DISCRIMINATED", "POWERLESS"), na.rm = TRUE),
+    n_ethnic_groups = n_distinct(groupid),
+    most_common_status = if (all(is.na(status_clean))) NA_character_ else names(sort(table(status_clean), decreasing = TRUE))[1],
+    .groups = "drop"
+  )
+
+# Check
+summary(ethnic_summary$has_excluded_group)
+
+# Round
+ethnic_summary <- ethnic_summary %>%
+  mutate(
+    lon = round(lon, 0),  
+    lat = round(lat, 0)
+  )
+
+# Join back with final_data
+final_data <- final_data %>%
+  left_join(ethnic_summary, by = c("lon", "lat", "year")) %>%
+  mutate(
+    has_excluded_group = replace_na(has_excluded_group, FALSE),
+    n_ethnic_groups = replace_na(n_ethnic_groups, 0),
+    most_common_status = replace_na(most_common_status, "None")
+  )
+
+# Cleanup before saving
+final_data <- final_data %>% 
+  select(-geometry, -date)
+
+# Saving final dataset
+write.csv(final_data, "ClimateConflict_BAdata_PaulinaWolf.csv", row.names = FALSE)
+```
